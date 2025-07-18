@@ -88,10 +88,38 @@
   }
 )
 
+;; Helper Functions for Input Validation
+(define-private (is-valid-principal (p principal))
+  (not (is-eq p contract-owner)) ;; Simple check to ensure it's not the contract itself
+)
+
+(define-private (is-valid-string (s (string-ascii 256)))
+  (and (> (len s) u0) (<= (len s) u256))
+)
+
+(define-private (is-valid-short-string (s (string-ascii 64)))
+  (and (> (len s) u0) (<= (len s) u64))
+)
+
+(define-private (is-valid-tracking-number (s (string-ascii 32)))
+  (and (> (len s) u0) (<= (len s) u32))
+)
+
+(define-private (is-valid-amount (amount uint))
+  (and (> amount u0) (<= amount u340282366920938463463374607431768211455)) ;; Max uint
+)
+
+(define-private (is-valid-tax-rate (rate uint))
+  (<= rate u10000) ;; Max 100% in basis points
+)
+
 ;; Authorization Functions
 (define-public (add-customs-officer (officer principal) (name (string-ascii 64)) (department (string-ascii 64)))
   (begin
     (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
+    (asserts! (is-valid-principal officer) ERR-INVALID-INPUT)
+    (asserts! (is-valid-short-string name) ERR-INVALID-INPUT)
+    (asserts! (is-valid-short-string department) ERR-INVALID-INPUT)
     (asserts! (is-none (map-get? authorized-officers { officer: officer })) ERR-ALREADY-EXISTS)
     (ok (map-set authorized-officers
       { officer: officer }
@@ -108,6 +136,7 @@
 (define-public (deactivate-officer (officer principal))
   (begin
     (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
+    (asserts! (is-valid-principal officer) ERR-INVALID-INPUT)
     (match (map-get? authorized-officers { officer: officer })
       officer-data (ok (map-set authorized-officers
         { officer: officer }
@@ -120,6 +149,8 @@
 
 (define-public (register-importer (name (string-ascii 64)) (license-number (string-ascii 32)))
   (begin
+    (asserts! (is-valid-short-string name) ERR-INVALID-INPUT)
+    (asserts! (is-valid-tracking-number license-number) ERR-INVALID-INPUT)
     (asserts! (is-none (map-get? importer-profiles { importer: tx-sender })) ERR-ALREADY-EXISTS)
     (ok (map-set importer-profiles
       { importer: tx-sender }
@@ -139,6 +170,7 @@
 (define-public (set-customs-fee (new-fee uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
+    (asserts! (is-valid-amount new-fee) ERR-INVALID-INPUT)
     (ok (var-set customs-fee new-fee))
   )
 )
@@ -146,6 +178,7 @@
 (define-public (set-processing-time (new-time uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
+    (asserts! (and (> new-time u0) (<= new-time u52560)) ERR-INVALID-INPUT) ;; Max ~1 year in blocks
     (ok (var-set processing-time new-time))
   )
 )
@@ -153,6 +186,8 @@
 (define-public (set-country-tax-rate (country (string-ascii 64)) (tax-rate uint) (is-restricted bool))
   (begin
     (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
+    (asserts! (is-valid-short-string country) ERR-INVALID-INPUT)
+    (asserts! (is-valid-tax-rate tax-rate) ERR-INVALID-INPUT)
     (ok (map-set country-tax-rates
       { country: country }
       {
@@ -166,14 +201,29 @@
 (define-public (set-category-restriction (category (string-ascii 64)) (requires-license bool) (additional-fee uint) (max-value (optional uint)))
   (begin
     (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
-    (ok (map-set category-restrictions
-      { category: category }
-      {
-        requires-license: requires-license,
-        additional-fee: additional-fee,
-        max-value: max-value
-      }
-    ))
+    (asserts! (is-valid-short-string category) ERR-INVALID-INPUT)
+    (asserts! (is-valid-amount additional-fee) ERR-INVALID-INPUT)
+    (match max-value
+      max-val (begin
+        (asserts! (is-valid-amount max-val) ERR-INVALID-INPUT)
+        (ok (map-set category-restrictions
+          { category: category }
+          {
+            requires-license: requires-license,
+            additional-fee: additional-fee,
+            max-value: (some max-val)
+          }
+        ))
+      )
+      (ok (map-set category-restrictions
+        { category: category }
+        {
+          requires-license: requires-license,
+          additional-fee: additional-fee,
+          max-value: none
+        }
+      ))
+    )
   )
 )
 
@@ -190,22 +240,31 @@
   (let
     (
       (declaration-id (var-get next-declaration-id))
-      (total-fee (calculate-total-fee goods-value origin-country category))
+      (validated-origin-country (begin
+        (asserts! (is-valid-short-string origin-country) ERR-INVALID-INPUT)
+        origin-country
+      ))
+      (validated-category (begin
+        (asserts! (is-valid-short-string category) ERR-INVALID-INPUT)
+        category
+      ))
+      (total-fee (calculate-total-fee goods-value validated-origin-country validated-category))
       (expiry-block (+ block-height (var-get processing-time)))
     )
-    (asserts! (> (len goods-description) u0) ERR-INVALID-INPUT)
-    (asserts! (> goods-value u0) ERR-INVALID-INPUT)
-    (asserts! (> weight u0) ERR-INVALID-INPUT)
-    (asserts! (> (len tracking-number) u0) ERR-INVALID-INPUT)
+    (asserts! (is-valid-string goods-description) ERR-INVALID-INPUT)
+    (asserts! (is-valid-amount goods-value) ERR-INVALID-INPUT)
+    (asserts! (is-valid-short-string destination-country) ERR-INVALID-INPUT)
+    (asserts! (is-valid-amount weight) ERR-INVALID-INPUT)
+    (asserts! (is-valid-tracking-number tracking-number) ERR-INVALID-INPUT)
     
     ;; Check if country is restricted
-    (match (map-get? country-tax-rates { country: origin-country })
+    (match (map-get? country-tax-rates { country: validated-origin-country })
       country-data (asserts! (not (get is-restricted country-data)) ERR-INVALID-INPUT)
       true ;; Country not in map, allow
     )
     
     ;; Check category restrictions
-    (match (map-get? category-restrictions { category: category })
+    (match (map-get? category-restrictions { category: validated-category })
       category-data (begin
         (match (get max-value category-data)
           max-val (asserts! (<= goods-value max-val) ERR-INVALID-INPUT)
@@ -232,10 +291,10 @@
         importer: tx-sender,
         goods-description: goods-description,
         goods-value: goods-value,
-        origin-country: origin-country,
+        origin-country: validated-origin-country,
         destination-country: destination-country,
         weight: weight,
-        category: category,
+        category: validated-category,
         status: STATUS-PENDING,
         submitted-at: block-height,
         reviewed-at: none,
@@ -267,7 +326,11 @@
 (define-public (review-declaration (declaration-id uint))
   (let
     (
-      (declaration (unwrap! (map-get? declarations { declaration-id: declaration-id }) ERR-NOT-FOUND))
+      (validated-declaration-id (begin
+        (asserts! (> declaration-id u0) ERR-INVALID-INPUT)
+        declaration-id
+      ))
+      (declaration (unwrap! (map-get? declarations { declaration-id: validated-declaration-id }) ERR-NOT-FOUND))
       (officer-data (unwrap! (map-get? authorized-officers { officer: tx-sender }) ERR-UNAUTHORIZED-ACCESS))
     )
     (asserts! (get is-active officer-data) ERR-UNAUTHORIZED-ACCESS)
@@ -275,7 +338,7 @@
     (asserts! (< block-height (get expiry-block declaration)) ERR-EXPIRED)
     
     (ok (map-set declarations
-      { declaration-id: declaration-id }
+      { declaration-id: validated-declaration-id }
       (merge declaration {
         status: STATUS-UNDER-REVIEW,
         reviewed-at: (some block-height),
@@ -288,7 +351,11 @@
 (define-public (approve-declaration (declaration-id uint))
   (let
     (
-      (declaration (unwrap! (map-get? declarations { declaration-id: declaration-id }) ERR-NOT-FOUND))
+      (validated-declaration-id (begin
+        (asserts! (> declaration-id u0) ERR-INVALID-INPUT)
+        declaration-id
+      ))
+      (declaration (unwrap! (map-get? declarations { declaration-id: validated-declaration-id }) ERR-NOT-FOUND))
       (officer-data (unwrap! (map-get? authorized-officers { officer: tx-sender }) ERR-UNAUTHORIZED-ACCESS))
     )
     (asserts! (get is-active officer-data) ERR-UNAUTHORIZED-ACCESS)
@@ -298,7 +365,7 @@
     
     ;; Update declaration
     (map-set declarations
-      { declaration-id: declaration-id }
+      { declaration-id: validated-declaration-id }
       (merge declaration {
         status: STATUS-APPROVED,
         approved-at: (some block-height)
@@ -321,14 +388,21 @@
 (define-public (reject-declaration (declaration-id uint) (reason (string-ascii 256)))
   (let
     (
-      (declaration (unwrap! (map-get? declarations { declaration-id: declaration-id }) ERR-NOT-FOUND))
+      (validated-declaration-id (begin
+        (asserts! (> declaration-id u0) ERR-INVALID-INPUT)
+        declaration-id
+      ))
+      (validated-reason (begin
+        (asserts! (is-valid-string reason) ERR-INVALID-INPUT)
+        reason
+      ))
+      (declaration (unwrap! (map-get? declarations { declaration-id: validated-declaration-id }) ERR-NOT-FOUND))
       (officer-data (unwrap! (map-get? authorized-officers { officer: tx-sender }) ERR-UNAUTHORIZED-ACCESS))
     )
     (asserts! (get is-active officer-data) ERR-UNAUTHORIZED-ACCESS)
     (asserts! (is-eq (get status declaration) STATUS-UNDER-REVIEW) ERR-INVALID-STATUS)
     (asserts! (< block-height (get expiry-block declaration)) ERR-EXPIRED)
     (asserts! (is-eq (some tx-sender) (get reviewing-officer declaration)) ERR-UNAUTHORIZED-ACCESS)
-    (asserts! (> (len reason) u0) ERR-INVALID-INPUT)
     
     ;; Refund partial fee (keep processing fee)
     (let ((refund-amount (/ (* (get customs-fee-paid declaration) u80) u100))) ;; 80% refund
@@ -336,10 +410,10 @@
     )
     
     (ok (map-set declarations
-      { declaration-id: declaration-id }
+      { declaration-id: validated-declaration-id }
       (merge declaration {
         status: STATUS-REJECTED,
-        rejection-reason: (some reason)
+        rejection-reason: (some validated-reason)
       })
     ))
   )
@@ -348,14 +422,18 @@
 (define-public (release-goods (declaration-id uint))
   (let
     (
-      (declaration (unwrap! (map-get? declarations { declaration-id: declaration-id }) ERR-NOT-FOUND))
+      (validated-declaration-id (begin
+        (asserts! (> declaration-id u0) ERR-INVALID-INPUT)
+        declaration-id
+      ))
+      (declaration (unwrap! (map-get? declarations { declaration-id: validated-declaration-id }) ERR-NOT-FOUND))
       (officer-data (unwrap! (map-get? authorized-officers { officer: tx-sender }) ERR-UNAUTHORIZED-ACCESS))
     )
     (asserts! (get is-active officer-data) ERR-UNAUTHORIZED-ACCESS)
     (asserts! (is-eq (get status declaration) STATUS-APPROVED) ERR-INVALID-STATUS)
     
     (ok (map-set declarations
-      { declaration-id: declaration-id }
+      { declaration-id: validated-declaration-id }
       (merge declaration { status: STATUS-RELEASED })
     ))
   )
@@ -364,7 +442,11 @@
 (define-public (expire-declaration (declaration-id uint))
   (let
     (
-      (declaration (unwrap! (map-get? declarations { declaration-id: declaration-id }) ERR-NOT-FOUND))
+      (validated-declaration-id (begin
+        (asserts! (> declaration-id u0) ERR-INVALID-INPUT)
+        declaration-id
+      ))
+      (declaration (unwrap! (map-get? declarations { declaration-id: validated-declaration-id }) ERR-NOT-FOUND))
     )
     (asserts! (>= block-height (get expiry-block declaration)) ERR-INVALID-STATUS)
     (asserts! (or (is-eq (get status declaration) STATUS-PENDING) 
@@ -376,7 +458,7 @@
     )
     
     (ok (map-set declarations
-      { declaration-id: declaration-id }
+      { declaration-id: validated-declaration-id }
       (merge declaration { status: STATUS-EXPIRED })
     ))
   )
@@ -398,6 +480,7 @@
 (define-public (verify-importer (importer principal))
   (begin
     (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
+    (asserts! (is-valid-principal importer) ERR-INVALID-INPUT)
     (match (map-get? importer-profiles { importer: importer })
       profile (ok (map-set importer-profiles
         { importer: importer }
@@ -477,6 +560,7 @@
 (define-public (emergency-withdraw (amount uint))
   (begin
     (asserts! (is-eq tx-sender contract-owner) ERR-OWNER-ONLY)
+    (asserts! (is-valid-amount amount) ERR-INVALID-INPUT)
     (as-contract (stx-transfer? amount tx-sender contract-owner))
   )
 )
